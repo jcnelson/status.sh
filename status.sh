@@ -29,7 +29,11 @@ for cmd in ncat egrep grep tr dd sed cut date sqlite3 awk xxd $OPENSSL blockstac
 done
 
 if [ $(echo ${BASH_VERSION} | cut -d '.' -f 1) -lt 4 ]; then
-   exit_error "This script requires Bash 4.x or higher"
+   exit_error "This script requires Bash 4.3 or higher"
+
+   if [ $(echo ${BASH_VERSION} | cut -d '.' -f 2) -lt 3 ]; then
+      exit_error "This script requires Bash 4.3 or higher"
+   fi
 fi
 
 set -uo pipefail
