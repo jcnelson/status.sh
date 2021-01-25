@@ -15,13 +15,16 @@ STACKS_HEADERS_DB="$STACKS_WORKING_DIR/chainstate/chain-01000000-mainnet/vm/inde
 STACKS_SORTITION_DB="$STACKS_WORKING_DIR/burnchain/db/bitcoin/mainnet/sortition.db/marf"
 STACKS_MEMPOOL_DB="$STACKS_WORKING_DIR/chainstate/mempool.db"
 
+# customize to your environment
+OPENSSL=openssl
+
 exit_error() {
    printf "$1" >&2
    exit 1
 }
 
 # NOTE: blockstack-cli is from the stacks-blockchain repo, not the deprecated node.js CLI
-for cmd in ncat egrep grep tr dd sed cut date sqlite3 awk xxd openssl blockstack-cli; do
+for cmd in ncat egrep grep tr dd sed cut date sqlite3 awk xxd $OPENSSL blockstack-cli; do
    which $cmd >/dev/null 2>&1 || exit_error "Missing command: $cmd"
 done
 
@@ -225,7 +228,7 @@ row_transpose() {
 make_index_block_hash() {
    local CONSENSUS_HASH="$1"
    local BLOCK_HASH="$2"
-   echo "${BLOCK_HASH}${CONSENSUS_HASH}" | xxd -r -p - | openssl dgst -sha512-256 | cut -d ' ' -f 2
+   echo "${BLOCK_HASH}${CONSENSUS_HASH}" | xxd -r -p - | $OPENSSL dgst -sha512-256 | cut -d ' ' -f 2
 }
 
 query_stacks_block_ptrs() {
@@ -683,7 +686,7 @@ get_page_stacks_block() {
       fi
    fi
    
-   local BLOCK_JSON="$(/bin/cat "$BLOCK_PATH" | blockstack-cli decode-block - | jq)"
+   local BLOCK_JSON="$(/bin/cat "$BLOCK_PATH" | blockstack-cli decode-block - | jq .)"
    local RAW_BLOCK="$(/bin/cat "$BLOCK_PATH" | xxd -ps -c 65536 | tr -d '\n')"
    
    if [[ "$FORMAT" = "html" ]]; then
@@ -738,10 +741,10 @@ get_page_stacks_microblocks() {
    
    if [[ "$FORMAT" = "html" ]]; then
       echo "<div style='font-family:\"Courier New\", Courier, monospace; font-size:80%'><b>Microblocks</b><br><div style=\"white-space: pre-wrap;\">" | http_stream
-      http_chunk "$(printf "$MICROBLOCKS_JSON" | jq)"
+      http_chunk "$(printf "$MICROBLOCKS_JSON" | jq .)"
    
    else
-      http_chunk "$(printf "$MICROBLOCKS_JSON" | jq)"
+      http_chunk "$(printf "$MICROBLOCKS_JSON" | jq .)"
    fi
 
    return 0
@@ -775,7 +778,7 @@ get_page_mempool_tx() {
       echo "," | http_stream
    fi
    
-   local TXJSON="$(blockstack-cli decode-tx "$TX" | jq)"
+   local TXJSON="$(blockstack-cli decode-tx "$TX" | jq .)"
 
    if [[ "$FORMAT" = "html" ]]; then
       echo "<br><div style='font-family:\"Courier New\", Courier, monospace; font-size:80%'><b>Transaction</b><br><div style=\"white-space: pre-wrap;\">" | http_stream
