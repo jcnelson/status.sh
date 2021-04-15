@@ -392,13 +392,21 @@ query_miner_power() {
 }
 
 query_successful_miners() {
-   local min_btc_height="$1"
+   local btc_height_range="$1"
+   local btc_height
+   local min_btc_height
+   local min_stacks_height
+
+   btc_height="$(sqlite3 -noheader "$STACKS_SORTITION_DB" "SELECT MAX(block_height) FROM snapshots")"
+   min_btc_height=$((btc_height - btc_height_range))
+   min_stacks_height="$(sqlite3 -noheader "$STACKS_HEADERS_DB" "SELECT MIN(block_height) from block_headers WHERE burn_header_height >= $min_btc_height")"
+
    printf "total_blocks|address|total_btc|total_stx\n"
-   sqlite3 -noheader "$STACKS_HEADERS_DB" "SELECT DISTINCT address FROM payments WHERE stacks_block_height" | ( \
+   sqlite3 -noheader "$STACKS_HEADERS_DB" "SELECT DISTINCT address FROM payments WHERE stacks_block_height >= $min_stacks_height" | ( \
       local addr=""
       local columns="COUNT(index_block_hash) AS total_blocks,address,SUM(burnchain_commit_burn) AS total_btc,(SUM(coinbase + tx_fees_anchored + tx_fees_streamed)) AS total_stx"
       while read -r addr; do 
-         sqlite3 -noheader "$STACKS_HEADERS_DB" "SELECT $columns FROM payments WHERE address = '$addr' LIMIT 1"
+         sqlite3 -noheader "$STACKS_HEADERS_DB" "SELECT $columns FROM payments WHERE address = '$addr' AND stacks_block_height >= $min_stacks_height LIMIT 1"
       done
    ) | sort -rh
 }
@@ -588,14 +596,14 @@ get_page_miner_power() {
 
 get_page_successful_miners() {
    local format="$1"
-   local min_height="$2"
+   local btc_height_range="$2"
 
    if [[ "$format" = "html" ]]; then 
-      echo "<h3 id=\"successful_miners\"><b>Successful Miners</b></h3>" | http_stream
-      query_successful_miners "$min_height" | rows_to_table | http_stream
+      echo "<h3 id=\"successful_miners\"><b>Successful Miners for the Last $btc_height_range Bitcoin blocks</b></h3>" | http_stream
+      query_successful_miners "$btc_height_range" | rows_to_table | http_stream
 
    elif [[ "$format" = "json" ]]; then
-      query_successful_miners "$min_height" | rows_to_json | http_stream
+      query_successful_miners "$btc_height_range" | rows_to_json | http_stream
    fi
 
    return 0
@@ -1028,7 +1036,7 @@ handle_request() {
                   get_page_list_sortitions "html" 50 0
                   get_page_list_miners "html" 50 0
                   get_page_miner_power "html" 144
-                  get_page_successful_miners "html" 0
+                  get_page_successful_miners "html" 144
                   get_page_list_mempool "html" 50 0
                   http_page_end
                   ;;
