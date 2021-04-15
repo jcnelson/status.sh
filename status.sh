@@ -8,16 +8,20 @@ MODE="$1"
 STACKS_WORKING_DIR="$2"
 
 REPORT_MODE="http"
-CHAIN_MODE="mainnet"
+
+if [ -z "$CHAIN_MODE" ]; then
+    CHAIN_MODE="mainnet"
+fi
+
+if [ -z "$OPENSSL" ]; then
+    OPENSSL=openssl
+fi
 
 STACKS_BLOCKS_ROOT="$STACKS_WORKING_DIR/$CHAIN_MODE/chainstate/blocks/"
 STACKS_STAGING_DB="$STACKS_WORKING_DIR/$CHAIN_MODE/chainstate/vm/index.sqlite"
 STACKS_HEADERS_DB="$STACKS_WORKING_DIR/$CHAIN_MODE/chainstate/vm/index.sqlite"
 STACKS_SORTITION_DB="$STACKS_WORKING_DIR/$CHAIN_MODE/burnchain/sortition/marf.sqlite"
 STACKS_MEMPOOL_DB="$STACKS_WORKING_DIR/$CHAIN_MODE/chainstate/mempool.sqlite"
-
-# customize to your environment
-OPENSSL=openssl
 
 exit_error() {
    printf "%s" "$1" >&2
@@ -312,12 +316,9 @@ query_stacks_block_miners() {
 
 query_miner_power() {
    local min_btc_height="$1"
-   declare -A addr_counts
-   declare -A addr_total_btc
-   declare -A addr_total_stx
 
-   local tip
-   local height
+   local tip=""
+   local height=""
    local addr=""
    local count=0
 
@@ -325,75 +326,75 @@ query_miner_power() {
    height="$(sqlite3 -noheader "$STACKS_SORTITION_DB" "SELECT MAX(block_height) FROM snapshots")"
    local max_blocks=$((height - min_btc_height))
 
-
-   while (( height > min_btc_height )); do
-      local parent_consensus_hash
-      local parent_block_hash
-      local address
-      local btc_commit
-      local stx_reward
-
-      IFS="|"
-      read -r address parent_consensus_hash parent_block_hash btc_commit stx_reward <<< \
-         "$(sqlite3 -noheader "$STACKS_HEADERS_DB" "SELECT address,parent_consensus_hash,parent_block_hash,burnchain_commit_burn,(coinbase + tx_fees_anchored + tx_fees_streamed) AS stx_reward FROM payments WHERE index_block_hash = \"$tip\"")"
-
-      if [ -z "$parent_consensus_hash" ]; then
-         break
-      fi
-
-      tip="$(make_index_block_hash "$parent_consensus_hash" "$parent_block_hash")"
-      height="$(sqlite3 -noheader "$STACKS_HEADERS_DB" "SELECT burn_header_height FROM block_headers WHERE index_block_hash = '$tip'")"
-
-      if [ -z "$height" ]; then
-         break
-      fi
-
-      if [[ -v "addr_counts[$address]" ]]; then
-         addr_counts["$address"]=$((addr_counts["$address"] + 1))
-      else
-         addr_counts["$address"]=1
-      fi
-
-      if [[ -v "addr_total_btc[$address]" ]]; then
-         addr_total_btc["$address"]=$((addr_total_btc["$address"] + btc_commit))
-      else
-         addr_total_btc["$address"]=$btc_commit
-      fi
-
-      if [[ -v "addr_total_stx[$address]" ]]; then
-         addr_total_stx["$address"]=$((addr_total_stx["$address"] + stx_reward))
-      else
-         addr_total_stx["$address"]=$stx_reward
-      fi
-
-      count=$((count + 1))
-   done
-
-   # fill in missing
-   addr_counts["(no-canonical-sortition)"]=$((max_blocks - count))
-   addr_total_btc["(no-canonical-sortition)"]=0
-   addr_total_stx["(no-canonical-sortition)"]=0
-
    printf "total_blocks|address|total_btc_sats|total_ustx|stx_per_btc|win_rate|power\n"
-   (
-       for addr in "${!addr_counts[@]}"; do
-          local stx_per_btc="0.00000000"
-          local miner_power="0.00"
-          if (( ${addr_total_btc["$addr"]} != 0 )); then
-             stx_per_btc="$(echo "scale=8; (${addr_total_stx["$addr"]} / 1000000.0) / (${addr_total_btc["$addr"]} / 100000000.0)" | bc)"
-             miner_power="$(echo "scale=2; (${addr_counts["$addr"]} * 100) / $count" | bc)"
-          fi
-          local win_rate
-          win_rate="$(echo "scale=2; (${addr_counts["$addr"]} * 100) / $max_blocks" | bc)"
-          printf "%d|%s|%d|%d|%.8f|%.2f|%.2f\n" ${addr_counts["$addr"]} "$addr" ${addr_total_btc["$addr"]} ${addr_total_stx["$addr"]} "$stx_per_btc" "$win_rate" "$miner_power"
-       done
-   ) | sort -rh
+   sqlite3 -noheader "$STACKS_HEADERS_DB" \
+        "WITH RECURSIVE block_ancestors(burn_header_height,parent_block_id,address,burnchain_commit_burn,stx_reward) AS (
+             SELECT block_headers.burn_header_height,block_headers.parent_block_id,payments.address,payments.burnchain_commit_burn,(payments.coinbase + payments.tx_fees_anchored + payments.tx_fees_streamed) AS stx_reward 
+             FROM block_headers JOIN payments ON block_headers.index_block_hash = payments.index_block_hash WHERE payments.index_block_hash = \"$tip\" 
+             
+             UNION ALL
+             
+             SELECT block_headers.burn_header_height,block_headers.parent_block_id,payments.address,payments.burnchain_commit_burn,(payments.coinbase + payments.tx_fees_anchored + payments.tx_fees_streamed) AS stx_reward 
+             FROM (block_headers JOIN payments ON block_headers.index_block_hash = payments.index_block_hash) JOIN block_ancestors ON block_headers.index_block_hash = block_ancestors.parent_block_id
+        )
+        SELECT block_ancestors.burn_header_height,block_ancestors.address,block_ancestors.burnchain_commit_burn,block_ancestors.stx_reward FROM block_ancestors LIMIT $max_blocks" | (
+            declare -A addr_counts
+            declare -A addr_total_btc
+            declare -A addr_total_stx
+
+            local address
+            local btc_commit
+            local stx_reward
+            local cur_burn_height
+
+            while IFS="|" read -r cur_burn_height address btc_commit stx_reward; do
+               if (( "$cur_burn_height" <= "$min_btc_height" )); then
+                  continue;
+               fi
+
+               if [[ -v "addr_counts[$address]" ]]; then
+                  addr_counts["$address"]=$((addr_counts["$address"] + 1))
+               else
+                  addr_counts["$address"]=1
+               fi
+
+               if [[ -v "addr_total_btc[$address]" ]]; then
+                  addr_total_btc["$address"]=$((addr_total_btc["$address"] + btc_commit))
+               else
+                  addr_total_btc["$address"]=$btc_commit
+               fi
+
+               if [[ -v "addr_total_stx[$address]" ]]; then
+                  addr_total_stx["$address"]=$((addr_total_stx["$address"] + stx_reward))
+               else
+                  addr_total_stx["$address"]=$stx_reward
+               fi
+
+               count=$((count + 1))
+            done
+
+            addr_counts["(no-canonical-sortition)"]=$((max_blocks - count))
+            addr_total_btc["(no-canonical-sortition)"]=0
+            addr_total_stx["(no-canonical-sortition)"]=0
+
+            for addr in "${!addr_counts[@]}"; do
+               local stx_per_btc="0.00000000"
+               local miner_power="0.00"
+               if (( ${addr_total_btc["$addr"]} != 0 )); then
+                  stx_per_btc="$(echo "scale=8; (${addr_total_stx["$addr"]} / 1000000.0) / (${addr_total_btc["$addr"]} / 100000000.0)" | bc)"
+                  miner_power="$(echo "scale=2; (${addr_counts["$addr"]} * 100) / $count" | bc)"
+               fi
+               local win_rate
+               win_rate="$(echo "scale=2; (${addr_counts["$addr"]} * 100) / $max_blocks" | bc)"
+               printf "%d|%s|%d|%d|%.8f|%.2f|%.2f\n" ${addr_counts["$addr"]} "$addr" ${addr_total_btc["$addr"]} ${addr_total_stx["$addr"]} "$stx_per_btc" "$win_rate" "$miner_power"
+            done
+       ) | sort -rh
 }
 
 query_successful_miners() {
    local min_btc_height="$1"
    printf "total_blocks|address|total_btc|total_stx\n"
-   sqlite3 -noheader "$STACKS_HEADERS_DB" "SELECT DISTINCT address FROM payments" | ( \
+   sqlite3 -noheader "$STACKS_HEADERS_DB" "SELECT DISTINCT address FROM payments WHERE stacks_block_height" | ( \
       local addr=""
       local columns="COUNT(index_block_hash) AS total_blocks,address,SUM(burnchain_commit_burn) AS total_btc,(SUM(coinbase + tx_fees_anchored + tx_fees_streamed)) AS total_stx"
       while read -r addr; do 
