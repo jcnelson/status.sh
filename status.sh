@@ -30,7 +30,7 @@ exit_error() {
 
 # NOTE: blockstack-cli is from the stacks-blockchain repo, not the deprecated node.js CLI
 for cmd in ncat grep tr dd sed cut date sqlite3 awk xxd $OPENSSL blockstack-cli; do
-   which $cmd >/dev/null 2>&1 || exit_error "Missing command: $cmd"
+   command -v $cmd >/dev/null 2>&1 || exit_error "Missing command: $cmd"
 done
 
 if [ "$(echo "${BASH_VERSION}" | cut -d '.' -f 1)" -lt 4 ]; then
@@ -279,9 +279,9 @@ query_burnchain_height() {
 
 query_sortitions() {
    local predicate="$1"
-   local columns="block_height,burn_header_hash,burn_header_timestamp,consensus_hash,winning_stacks_block_hash"
-   sqlite3 -noheader "$STACKS_SORTITION_DB" "SELECT $columns FROM snapshots $predicate" | ( \
-      printf "height|burn_header_hash|timestamp|index_block_hash\n"
+   local columns="snapshots.block_height,snapshots.burn_header_hash,snapshots.burn_header_timestamp,snapshots.consensus_hash,snapshots.winning_stacks_block_hash,block_commits.memo"
+   sqlite3 -noheader "$STACKS_SORTITION_DB" "SELECT $columns FROM snapshots JOIN block_commits ON snapshots.winning_block_txid = block_commits.txid $predicate" | ( \
+      printf "height|burn_header_hash|timestamp|memo|index_block_hash\n"
 
       local block_height
       local burn_header_hash
@@ -289,15 +289,16 @@ query_sortitions() {
       local consensus_hash
       local winning_stacks_block_hash
       local index_block_hash
+      local memo
 
       IFS="|"
-      while read -r block_height burn_header_hash burn_header_timestamp consensus_hash winning_stacks_block_hash; do
+      while read -r block_height burn_header_hash burn_header_timestamp consensus_hash winning_stacks_block_hash memo; do
          index_block_hash="0000000000000000000000000000000000000000000000000000000000000000"
          if [[ "$winning_stacks_block_hash" != "0000000000000000000000000000000000000000000000000000000000000000" ]]; then
             index_block_hash="$(make_index_block_hash "$consensus_hash" "$winning_stacks_block_hash")"
          fi
-         printf "%d|%s|%d|%s\n" \
-            "$block_height" "$burn_header_hash" "$burn_header_timestamp" "$index_block_hash"
+         printf "%d|%s|%d|%s|%s\n" \
+            "$block_height" "$burn_header_hash" "$burn_header_timestamp" "$memo" "$index_block_hash"
       done
     )
 }
@@ -495,7 +496,7 @@ get_page_list_sortitions() {
    local format="$1"
    local limit="$2"
    local page="$3"
-   local query="WHERE pox_valid = 1 ORDER BY block_height DESC"
+   local query="WHERE snapshots.pox_valid = 1 ORDER BY snapshots.block_height DESC"
    if [[ "$limit" != "all" ]]; then
      local offset=$((page * limit))
      query="$query LIMIT $limit OFFSET $offset"
