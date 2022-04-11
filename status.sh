@@ -14,6 +14,7 @@ if [ -z "$CHAIN_MODE" ]; then
 fi
 
 if [ -z "$OPENSSL" ]; then
+    #OPENSSL=openssl11
     OPENSSL=openssl
 fi
 
@@ -23,13 +24,19 @@ STACKS_HEADERS_DB="$STACKS_WORKING_DIR/$CHAIN_MODE/chainstate/vm/index.sqlite"
 STACKS_SORTITION_DB="$STACKS_WORKING_DIR/$CHAIN_MODE/burnchain/sortition/marf.sqlite"
 STACKS_MEMPOOL_DB="$STACKS_WORKING_DIR/$CHAIN_MODE/chainstate/mempool.sqlite"
 
+COST_READ_COUNT=15000
+COST_READ_LENGTH=100000000
+COST_WRITE_COUNT=15000
+COST_WRITE_LENGTH=15000000
+COST_RUNTIME=5000000000
+
 exit_error() {
    printf "%s" "$1" >&2
    exit 1
 }
 
 # NOTE: blockstack-cli is from the stacks-blockchain repo, not the deprecated node.js CLI
-for cmd in ncat grep tr dd sed cut date sqlite3 awk xxd $OPENSSL blockstack-cli; do
+for cmd in ncat grep tr dd sed cut date sqlite3 awk xxd $OPENSSL blockstack-cli bc; do
    command -v $cmd >/dev/null 2>&1 || exit_error "Missing command: $cmd"
 done
 
@@ -240,33 +247,70 @@ make_index_block_hash() {
    echo "${block_hash}${consensus_hash}" | xxd -r -p - | "$OPENSSL" dgst -sha512-256 | cut -d ' ' -f 2
 }
 
+calculate_block_fullness() {
+   local cost_json="$1"
+   if [ -z "$cost_json" ]; then 
+      echo "N/A,N/A,N/A,N/A,N/A"
+      return 0
+   fi
+
+   local rc=0
+   local rl=0
+   local wc=0
+   local wl=0
+   local rt=0
+
+   echo "$cost_json" | \
+      jq -r '[ .write_length, .write_count, .read_length, .read_count, .runtime ] | .[]' | ( \
+         read wl;
+         read wc;
+         read rl;
+         read rc;
+         read rt;
+         echo "$(( (rc * 100) / $COST_READ_COUNT )),$(( (rl * 100) / $COST_READ_LENGTH )),$(( (wc * 100) / $COST_WRITE_COUNT )),$(( (wl * 100) / $COST_WRITE_LENGTH )),$(( (rt * 100) / $COST_RUNTIME ))"
+      )
+}
+
 query_stacks_block_ptrs() {
    local predicate="$1"
-   local columns="height,index_block_hash,consensus_hash,anchored_block_hash,parent_consensus_hash,parent_anchored_block_hash,processed,attachable,orphaned"
-   sqlite3 -header "$STACKS_STAGING_DB" "SELECT $columns FROM staging_blocks $predicate"
+   local columns=" \
+      staging_blocks.height AS height, \
+      staging_blocks.index_block_hash AS index_block_hash, \
+      staging_blocks.consensus_hash AS consensus_hash, \
+      staging_blocks.anchored_block_hash AS anchored_block_hash, \
+      staging_blocks.parent_consensus_hash AS parent_consensus_hash, \
+      staging_blocks.parent_anchored_block_hash AS parent_anchored_block_hash, \
+      staging_blocks.processed AS processed, \
+      staging_blocks.attachable AS attachable, \
+      staging_blocks.orphaned AS orphaned, \
+      block_headers.cost AS cost"
+   sqlite3 -header "$STACKS_STAGING_DB" "SELECT $columns FROM staging_blocks LEFT OUTER JOIN block_headers ON staging_blocks.index_block_hash = block_headers.index_block_hash $predicate" | sed -r 's/"/\\"/g'
 }
 
 query_stacks_index_blocks_by_height() {
    local predicate="$1"
-   local columns="height,index_block_hash,processed,orphaned"
-   sqlite3 -noheader "$STACKS_STAGING_DB" "SELECT $columns FROM staging_blocks $predicate" | ( \
-      printf "height|index_block_hash(processed,orphaned)\n"
+   local columns="staging_blocks.height,staging_blocks.index_block_hash,staging_blocks.processed,staging_blocks.orphaned,block_headers.cost"
+   sqlite3 -noheader "$STACKS_STAGING_DB" "SELECT $columns FROM staging_blocks LEFT OUTER JOIN block_headers ON staging_blocks.index_block_hash = block_headers.index_block_hash $predicate" | ( \
+      printf "height|index_block_hash(processed,orphaned;%%rc,%%rl,%%wc,%%wl,%%rt)\n"
 
       local last_height=0
       local height=0
       local index_block_hash=""
       local processed=0
       local orphaned=0
+      local cost_json=""
+      local fullness=""
       IFS="|"
-      while read -r height index_block_hash processed orphaned; do
+      while read -r height index_block_hash processed orphaned cost_json; do
+         fullness="$(calculate_block_fullness "$cost_json")"
          if (( height != last_height)); then
             if (( last_height > 0 )); then
                printf "\n"
             fi
             last_height="$height"
-            printf "%s|%s(%s,%s)" "$height" "$index_block_hash" "$processed" "$orphaned"
+            printf "%s|%s(%s,%s;%s)" "$height" "$index_block_hash" "$processed" "$orphaned" "$fullness"
          else
-            printf ",%s(%s,%s)" "$index_block_hash" "$processed" "$orphaned"
+            printf ",%s(%s,%s;%s)" "$index_block_hash" "$processed" "$orphaned" "$fullness"
          fi
       done
       printf "\n"
@@ -642,7 +686,7 @@ get_page_stacks_block() {
    fi
 
    local miner_query="WHERE index_block_hash = '$index_block_hash' AND miner = 1 LIMIT 1"
-   local parent_query="WHERE index_block_hash = '$index_block_hash' LIMIT 1"
+   local parent_query="WHERE staging_blocks.index_block_hash = '$index_block_hash' LIMIT 1"
 
    local has_block_processed
    local parent_block_ptr
