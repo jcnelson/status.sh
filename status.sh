@@ -14,8 +14,8 @@ if [ -z "$CHAIN_MODE" ]; then
 fi
 
 if [ -z "$OPENSSL" ]; then
-    #OPENSSL=openssl11
-    OPENSSL=openssl
+    OPENSSL=openssl11
+    #OPENSSL=openssl
 fi
 
 STACKS_BLOCKS_ROOT="$STACKS_WORKING_DIR/$CHAIN_MODE/chainstate/blocks/"
@@ -289,10 +289,11 @@ query_stacks_block_ptrs() {
 
 query_stacks_index_blocks_by_height() {
    local predicate="$1"
-   local columns="staging_blocks.height,staging_blocks.index_block_hash,staging_blocks.processed,staging_blocks.orphaned,block_headers.cost"
+   local columns="block_headers.version,staging_blocks.height,staging_blocks.index_block_hash,staging_blocks.processed,staging_blocks.orphaned,block_headers.cost"
    sqlite3 -noheader "$STACKS_STAGING_DB" "SELECT $columns FROM staging_blocks LEFT OUTER JOIN block_headers ON staging_blocks.index_block_hash = block_headers.index_block_hash $predicate" | ( \
-      printf "height|index_block_hash(processed,orphaned;%%rc,%%rl,%%wc,%%wl,%%rt)\n"
+      printf "height|version:index_block_hash(processed,orphaned;%%rc,%%rl,%%wc,%%wl,%%rt)\n"
 
+      local version=0
       local last_height=0
       local height=0
       local index_block_hash=""
@@ -301,16 +302,16 @@ query_stacks_index_blocks_by_height() {
       local cost_json=""
       local fullness=""
       IFS="|"
-      while read -r height index_block_hash processed orphaned cost_json; do
+      while read -r version height index_block_hash processed orphaned cost_json; do
          fullness="$(calculate_block_fullness "$cost_json")"
          if (( height != last_height)); then
             if (( last_height > 0 )); then
                printf "\n"
             fi
             last_height="$height"
-            printf "%s|%s(%s,%s;%s)" "$height" "$index_block_hash" "$processed" "$orphaned" "$fullness"
+            printf "%s|%s:%s(%s,%s;%s)" "$height" "$version" "$index_block_hash" "$processed" "$orphaned" "$fullness"
          else
-            printf ",%s(%s,%s;%s)" "$index_block_hash" "$processed" "$orphaned" "$fullness"
+            printf ",%s:%s(%s,%s;%s)" "$version" "$index_block_hash" "$processed" "$orphaned" "$fullness"
          fi
       done
       printf "\n"
@@ -324,7 +325,7 @@ query_burnchain_height() {
 query_sortitions() {
    local predicate="$1"
    local columns="snapshots.block_height,snapshots.burn_header_hash,snapshots.burn_header_timestamp,snapshots.consensus_hash,snapshots.winning_stacks_block_hash,block_commits.memo"
-   sqlite3 -noheader "$STACKS_SORTITION_DB" "SELECT $columns FROM snapshots JOIN block_commits ON snapshots.winning_block_txid = block_commits.txid $predicate" | ( \
+   sqlite3 -noheader "$STACKS_SORTITION_DB" "SELECT $columns FROM snapshots LEFT OUTER JOIN block_commits ON snapshots.winning_block_txid = block_commits.txid $predicate" | ( \
       printf "height|burn_header_hash|timestamp|memo|index_block_hash\n"
 
       local block_height
