@@ -14,8 +14,8 @@ if [ -z "$CHAIN_MODE" ]; then
 fi
 
 if [ -z "$OPENSSL" ]; then
-    OPENSSL=openssl11
-    #OPENSSL=openssl
+    #OPENSSL=openssl11
+    OPENSSL=openssl
 fi
 
 STACKS_BLOCKS_ROOT="$STACKS_WORKING_DIR/$CHAIN_MODE/chainstate/blocks/"
@@ -695,6 +695,7 @@ get_page_stacks_block() {
    local parent_block_hash
    local parent_microblock_seq
    local parent_microblock_hash
+   local burn_block_height
    local parent_index_block_hash
    local block_json
    local raw_block
@@ -724,6 +725,7 @@ get_page_stacks_block() {
 
    parent_microblock_seq="$(sqlite3 -noheader "$STACKS_HEADERS_DB" "SELECT parent_microblock_seq FROM staging_blocks WHERE index_block_hash = '$index_block_hash'")"
    parent_microblock_hash="$(sqlite3 -noheader "$STACKS_HEADERS_DB" "SELECT parent_microblock_hash FROM staging_blocks WHERE index_block_hash = '$index_block_hash'")"
+   burn_block_height="$(sqlite3 -noheader "$STACKS_HEADERS_DB" "SELECT burn_header_height FROM block_headers WHERE index_block_hash = '$index_block_hash'")"
 
    parent_index_block_hash="$(
      echo "$parent_block_ptr" | ( \
@@ -736,6 +738,7 @@ get_page_stacks_block() {
    if [[ "$format" = "html" ]]; then
       query_stacks_miners "$miner_query" | ( \
             row_transpose "block_id" "$index_block_hash"
+            echo "burn_block_height|$burn_block_height"
             echo "parent|<a href=\"/stacks/blocks/$parent_index_block_hash\">$parent_index_block_hash</a>"
 
             if [[ "$parent_microblock_hash" != "0000000000000000000000000000000000000000000000000000000000000000" ]]; then
@@ -756,6 +759,7 @@ get_page_stacks_block() {
          rows_to_json | \
          http_stream
       echo ", \"parent\": \"$parent_index_block_hash\", " | http_stream
+      echo ", \"burn_block_height\": \"$burn_block_height\", " | http_stream
 
       if [[ "$parent_microblock_hash" != "0000000000000000000000000000000000000000000000000000000000000000" ]]; then
          echo "\"parent_microblocks\": { \"parent_microblock_hash\": \"$parent_microblock_hash\", \"parent_microblock_seq\": \"$parent_microblock_seq\" }, " | http_stream
