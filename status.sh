@@ -36,7 +36,7 @@ exit_error() {
 }
 
 # NOTE: blockstack-cli is from the stacks-blockchain repo, not the deprecated node.js CLI
-for cmd in ncat grep tr dd sed cut date sqlite3 awk xxd $OPENSSL blockstack-cli bc; do
+for cmd in ncat grep tr dd sed cut date sqlite3 awk xxd $OPENSSL blockstack-cli bc base58; do
    command -v $cmd >/dev/null 2>&1 || exit_error "Missing command: $cmd"
 done
 
@@ -482,6 +482,87 @@ query_stacks_microblocks() {
    done
 }
 
+decode_pox_addr_b58() {
+   local addr_b58="$1"
+
+   local addr_bytes="$(echo "$addr_b58" | base58 -d | xxd -p -l 65536)"
+   local addr_version="${addr_bytes:0:2}"
+   local addr_hash_and_checksum="${addr_bytes:2}"
+   local stx_version="unknown"
+   local addr_hash="unknown"
+
+   if [[ "$addr_version" = "00" ]] || [[ "$addr_version" = "05" ]]; then 
+      # p2pkh or p2sh
+      if [[ "$addr_version" = "00" ]]; then
+         stx_version="22"
+      else
+         stx_version="20"
+      fi
+
+      addr_hash="${addr_hash_and_checksum:0:40}"
+   fi
+
+   echo "$stx_version $addr_hash"
+   return 0
+}
+
+decode_pox_addr() {
+   local mode="$1"
+   local addr_str="$2"
+   if [[ "$mode" = "standard" ]]; then
+      set -- $(decode_pox_addr_b58 "$addr_str")
+      local stx_version="$1"
+      local addr_hash="$2"
+
+      if [[ "$stx_version" = "unknown" ]] || [[ "$addr_hash" = "unknown" ]]; then
+         return 1
+      fi
+
+      if [[ "$stx_version" = "22" ]]; then
+         # p2pkh 
+         echo "{\"Standard\":[{\"version\":$stx_version,\"bytes\":\"$addr_hash\"},\"SerializeP2PKH\"]}"
+      elif [[ "$stx_version" = "20" ]]; then
+         # p2sh
+         echo "{\"Standard\":[{\"version\":$stx_version,\"bytes\":\"$addr_hash\"},\"SerializeP2SH\"]}"
+      else
+         # unreachable
+	 return 1
+      fi
+      return 0
+   fi
+
+   return 1
+}
+
+query_pox_payouts() {
+   local reward_cycle="$1"
+   local addr_json="$2"
+   
+   local start_height=$(($reward_cycle * 2100 + 666050))
+   local end_height=$(( ($reward_cycle + 1) * 2100 + 666050))
+
+   echo "block_height|btc_payout"
+   sqlite3 -noheader "$STACKS_SORTITION_DB" "SELECT block_height,pox_payouts FROM snapshots WHERE pox_valid = 1 AND block_height >= "$start_height" AND block_height < "$end_height" ORDER BY block_height DESC" | \
+      fgrep "$addr_json" | \
+      (
+	 local block_height
+         local pox_payouts
+	 local pox_btc=0
+	 local total_payout=0
+
+	 while IFS="|" read -r block_height pox_payouts; do
+            pox_payout="$(echo "$pox_payouts" | jq -r '.[1]')"
+	    total_payout=$((total_payout + pox_payout))
+            echo "$block_height|$pox_payout"
+         done
+
+	 local total_payout_btc="$(echo "scale=8; $total_payout / 10^8" | bc)"
+	 echo "total|$total_payout ("$total_payout_btc" BTC)"
+      )
+
+   return 0
+}
+
 make_prev_next_buttons() {
    local a_path="$1"
    local page="$2"
@@ -892,6 +973,39 @@ get_page_mempool_tx() {
    return 0
 }
 
+get_page_pox_payouts() {
+   local format="$1"
+   local mode="$2"
+   local addr="$3"
+   local reward_cycle="$4"
+
+   local addr_json="$(decode_pox_addr "$mode" "$addr")"
+   local rc=$?
+   if [[ $rc != 0 ]]; then
+      http_404 "Unrecognized mode and address combination (FYI: segwit/taproot is not yet supported)"
+      return 0
+   fi
+
+   if [[ "$format" = "html" ]]; then
+      http_page_begin
+      query_pox_payouts "$reward_cycle" "$addr_json" | \
+         rows_to_table | \
+         http_stream
+
+      http_page_end
+
+   elif [[ "$format" = "json" ]]; then
+      http_json_begin
+      query_pox_payouts "$reward_cycle" "$addr_json" | \
+         rows_to_json | \
+	 http_stream
+
+      http_json_end
+   fi
+
+   return 0
+}
+
 parse_request() {
    local reqline
    local verb=""
@@ -1072,6 +1186,19 @@ handle_request() {
                   fi
                   ;;
                
+               /stacks/pox-rewards/standard/*)
+                  local req="${reqpath#/stacks/pox-rewards/standard/}"
+		  if ! [[ $req =~ ^[123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz]+/[0-9]+$ ]]; then
+                     http_401
+                     status=401
+                  else
+                     local addr="$(echo "$req" | sed -r 's/^([^\/]+)\/.+$/\1/g')"
+                     local rc="$(echo "$req" | sed -r 's/^[^\/]+\/(.+)$/\1/g')"
+                     get_page_pox_payouts "html" "standard" "$addr" "$rc"
+                     rc=$?
+                  fi
+                  ;;
+
                /|/index.html)
                   http_page_begin
                   printf "%s\n%s\n%s\n%s\n%s\n%s\n" \
@@ -1226,7 +1353,6 @@ elif [ "$MODE" = "test" ]; then
    # undocumented test mode
    shift 2
    REPORT_MODE="text"
-   echo >&2 "test: " "$@"
    eval "$@"
    exit 0
 fi
