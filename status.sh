@@ -325,7 +325,7 @@ query_burnchain_height() {
 query_sortitions() {
    local predicate="$1"
    local columns="snapshots.block_height,snapshots.burn_header_hash,snapshots.burn_header_timestamp,snapshots.consensus_hash,snapshots.winning_stacks_block_hash,block_commits.memo"
-   sqlite3 -noheader "$STACKS_SORTITION_DB" "SELECT $columns FROM snapshots LEFT OUTER JOIN block_commits ON snapshots.winning_block_txid = block_commits.txid $predicate" | ( \
+   sqlite3 -noheader "$STACKS_SORTITION_DB" "SELECT DISTINCT $columns FROM snapshots LEFT OUTER JOIN block_commits ON snapshots.winning_block_txid = block_commits.txid $predicate" | ( \
       printf "height|burn_header_hash|timestamp|memo|index_block_hash\n"
 
       local block_height
