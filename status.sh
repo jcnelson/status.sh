@@ -549,15 +549,22 @@ query_pox_payouts() {
          local pox_payouts
 	 local pox_btc=0
 	 local total_payout=0
+	 local num_payouts=0
+	 local num_pox_payouts=0
+	 local i=0
 
 	 while IFS="|" read -r block_height pox_payouts; do
             pox_payout="$(echo "$pox_payouts" | jq -r '.[1]')"
-	    total_payout=$((total_payout + pox_payout))
-            echo "$block_height|$pox_payout"
+	    num_pox_payouts="$(echo "$pox_payouts" | grep -Fo "$addr_json" | wc -l)"
+	    total_payout=$((total_payout + (pox_payout * num_pox_payouts)))
+	    num_payouts=$((num_payouts + num_pox_payouts))
+            for i in $(seq 1 $num_pox_payouts); do
+               echo "$block_height|$pox_payout"
+            done
          done
 
 	 local total_payout_btc="$(echo "scale=8; $total_payout / 10^8" | bc)"
-	 echo "total|$total_payout ("$total_payout_btc" BTC)"
+	 echo "total: $num_payouts|$total_payout ("$total_payout_btc" BTC)"
       )
 
    return 0
