@@ -24,6 +24,9 @@ STACKS_HEADERS_DB="$STACKS_WORKING_DIR/$CHAIN_MODE/chainstate/vm/index.sqlite"
 STACKS_SORTITION_DB="$STACKS_WORKING_DIR/$CHAIN_MODE/burnchain/sortition/marf.sqlite"
 STACKS_MEMPOOL_DB="$STACKS_WORKING_DIR/$CHAIN_MODE/chainstate/mempool.sqlite"
 
+NAKAMOTO_STAGING_DB="$STACKS_WORKING_DIR/$CHAIN_MODE/chainstate/blocks/nakamoto.sqlite"
+NAKAMOTO_HEADERS_DB="$STACKS_WORKING_DIR/$CHAIN_MODE/chainstate/vm/index.sqlite"
+
 COST_READ_COUNT=15000
 COST_READ_LENGTH=100000000
 COST_WRITE_COUNT=15000
@@ -36,13 +39,14 @@ exit_error() {
 }
 
 # NOTE: blockstack-cli is from the stacks-blockchain repo, not the deprecated node.js CLI
-for cmd in ncat grep tr dd sed cut date sqlite3 awk xxd $OPENSSL blockstack-cli bc base58; do
-   command -v $cmd >/dev/null 2>&1 || exit_error "Missing command: $cmd"
+for cmd in ncat grep tr dd sed cut date sqlite3 awk xxd $OPENSSL blockstack-cli stacks-inspect bc base58; do
+   command -v "$cmd" >/dev/null 2>&1 || exit_error "Missing command: $cmd"
 done
 
 if [ "$(echo "${BASH_VERSION}" | cut -d '.' -f 1)" -lt 4 ]; then
    exit_error "This script requires Bash 4.3 or higher"
-
+fi
+if [ "$(echo "${BASH_VERSION}" | cut -d '.' -f 1)" -eq 4 ]; then
    if [ "$(echo "${BASH_VERSION}" | cut -d '.' -f 2)" -lt 3 ]; then
       exit_error "This script requires Bash 4.3 or higher"
    fi
@@ -50,6 +54,8 @@ fi
 
 set -uo pipefail
 set -Eo functrace
+
+NAKAMOTO_START_HEIGHT="$(sqlite3 "$STACKS_SORTITION_DB" -noheader "SELECT start_block_height FROM epochs WHERE epoch_id = 0x3000")"
 
 failure() {
   local lineno=$1
@@ -262,12 +268,12 @@ calculate_block_fullness() {
 
    echo "$cost_json" | \
       jq -r '[ .write_length, .write_count, .read_length, .read_count, .runtime ] | .[]' | ( \
-         read wl;
-         read wc;
-         read rl;
-         read rc;
-         read rt;
-         echo "$(( (rc * 100) / $COST_READ_COUNT )),$(( (rl * 100) / $COST_READ_LENGTH )),$(( (wc * 100) / $COST_WRITE_COUNT )),$(( (wl * 100) / $COST_WRITE_LENGTH )),$(( (rt * 100) / $COST_RUNTIME ))"
+         read -r wl;
+         read -r wc;
+         read -r rl;
+         read -r rc;
+         read -r rt;
+         echo "$(( (rc * 100) / COST_READ_COUNT )),$(( (rl * 100) / COST_READ_LENGTH )),$(( (wc * 100) / COST_WRITE_COUNT )),$(( (wl * 100) / COST_WRITE_LENGTH )),$(( (rt * 100) / COST_RUNTIME ))"
       )
 }
 
@@ -285,6 +291,21 @@ query_stacks_block_ptrs() {
       staging_blocks.orphaned AS orphaned, \
       block_headers.cost AS cost"
    sqlite3 -header "$STACKS_STAGING_DB" "SELECT $columns FROM staging_blocks LEFT OUTER JOIN block_headers ON staging_blocks.index_block_hash = block_headers.index_block_hash $predicate" | sed -r 's/"/\\"/g'
+}
+
+query_nakamoto_block_ptrs() {
+   local predicate="$1"
+   local columns=" \
+      nakamoto_staging_blocks.height AS height, \
+      nakamoto_staging_blocks.index_block_hash AS index_block_hash, \
+      nakamoto_staging_blocks.consensus_hash AS tenure_consensus_hash, \
+      nakamoto_staging_blocks.block_hash AS block_hash, \
+      nakamoto_staging_blocks.parent_block_id AS parent_block_id, \
+      nakamoto_staging_blocks.processed AS processed, \
+      nakamoto_staging_blocks.burn_attachable AS burn_attachable, \
+      nakamoto_staging_blocks.orphaned AS orphaned, \
+      nakamoto_staging_blocks.processed_time AS processed_time"
+   sqlite3 -header "$NAKAMOTO_STAGING_DB" "SELECT $columns FROM nakamoto_staging_blocks $predicate" | sed -r 's/"/\\"/g'
 }
 
 query_stacks_index_blocks_by_height() {
@@ -318,13 +339,40 @@ query_stacks_index_blocks_by_height() {
    )
 }
 
+query_processed_nakamoto_blocks_by_height() {
+   local predicate="$1"
+   local columns="version,block_height,burn_header_height,index_block_hash"
+   sqlite3 -noheader "$NAKAMOTO_HEADERS_DB" "SELECT $columns FROM nakamoto_block_headers $predicate" | ( \
+      printf "height|burn_height: version - tenure_start_block_id[, sibling tenures]\n"
+
+      local version=0
+      local burn_height=0
+      local last_height=0
+      local height=0
+      local index_block_hash=""
+      IFS="|"
+      while read -r version height burn_height index_block_hash; do
+         if (( height != last_height)); then
+            if (( last_height > 0 )); then
+               printf "\n"
+            fi
+            last_height="$height"
+            printf "%s|%s: %02x - %s" "$height" "$burn_height" "$version" "$index_block_hash"
+         else
+            printf ", %02x - %s" "$version" "$index_block_hash"
+         fi
+      done
+      printf "\n"
+   )
+}
+
 query_burnchain_height() {
    sqlite3 -noheader "$STACKS_SORTITION_DB" "SELECT MAX(block_height) FROM snapshots"
 }
 
 query_sortitions() {
    local predicate="$1"
-   local columns="snapshots.block_height,snapshots.burn_header_hash,snapshots.burn_header_timestamp,snapshots.consensus_hash,snapshots.winning_stacks_block_hash,block_commits.memo"
+   local columns="snapshots.block_height, snapshots.burn_header_hash, snapshots.burn_header_timestamp, snapshots.consensus_hash, snapshots.winning_stacks_block_hash, block_commits.memo"
    sqlite3 -noheader "$STACKS_SORTITION_DB" "SELECT DISTINCT $columns FROM snapshots LEFT OUTER JOIN block_commits ON snapshots.winning_block_txid = block_commits.txid $predicate" | ( \
       printf "height|burn_header_hash|timestamp|memo|index_block_hash\n"
 
@@ -348,7 +396,30 @@ query_sortitions() {
     )
 }
 
-query_stacks_miners() {
+query_nakamoto_sortitions() {
+   local predicate="$1"
+   local columns="snapshots.block_height, snapshots.burn_header_hash, snapshots.burn_header_timestamp, snapshots.consensus_hash, snapshots.winning_stacks_block_hash, block_commits.memo"
+   sqlite3 -noheader "$STACKS_SORTITION_DB" "SELECT DISTINCT $columns FROM snapshots LEFT OUTER JOIN block_commits ON snapshots.winning_block_txid = block_commits.txid $predicate" | ( \
+      printf "height|burn_header_hash|timestamp|memo|consensus_hash|parent_tenure_start_block_id\n"
+
+      local block_height
+      local burn_header_hash
+      local burn_header_timestamp
+      local consensus_hash
+      local winning_stacks_block_hash
+      local index_block_hash
+      local memo
+
+      IFS="|"
+      while read -r block_height burn_header_hash burn_header_timestamp consensus_hash index_block_hash memo; do
+         printf "%d|%s|%d|%s|%s|%s\n" \
+            "$block_height" "$burn_header_hash" "$burn_header_timestamp" "$memo" "$consensus_hash" "$index_block_hash"
+      done
+    )
+}
+
+
+query_miners() {
    local predicate="$1"
    local columns="address,block_hash,consensus_hash,parent_block_hash,parent_consensus_hash,coinbase,tx_fees_anchored,tx_fees_streamed,stx_burns,burnchain_commit_burn,burnchain_sortition_burn,stacks_block_height,miner,vtxindex,index_block_hash"
    sqlite3 -header "$STACKS_HEADERS_DB" "SELECT $columns FROM payments $predicate"
@@ -358,6 +429,12 @@ query_stacks_block_miners() {
    local predicate="$1"
    local columns="stacks_block_height as height,address,index_block_hash"
    sqlite3 -header "$STACKS_HEADERS_DB" "SELECT $columns FROM payments $predicate"
+}
+
+query_nakamoto_block_miners() {
+   local predicate="$1"
+   local columns="payments.stacks_block_height AS height, payments.address AS address, payments.index_block_hash AS tenure_start_block_id"
+   sqlite3 -header "$NAKAMOTO_HEADERS_DB" "SELECT $columns FROM payments JOIN nakamoto_block_headers ON nakamoto_block_headers.index_block_hash = payments.index_block_hash $predicate"
 }
 
 query_miner_power() {
@@ -399,20 +476,26 @@ query_miner_power() {
                fi
 
                if [[ -v "addr_counts[$address]" ]]; then
+                  # shellcheck disable=SC2030
                   addr_counts["$address"]=$((addr_counts["$address"] + 1))
                else
+                  # shellcheck disable=SC2030
                   addr_counts["$address"]=1
                fi
 
                if [[ -v "addr_total_btc[$address]" ]]; then
+                  # shellcheck disable=SC2030
                   addr_total_btc["$address"]=$((addr_total_btc["$address"] + btc_commit))
                else
+                  # shellcheck disable=SC2030
                   addr_total_btc["$address"]=$btc_commit
                fi
 
                if [[ -v "addr_total_stx[$address]" ]]; then
+                  # shellcheck disable=SC2030
                   addr_total_stx["$address"]=$((addr_total_stx["$address"] + stx_reward))
                else
+                  # shellcheck disable=SC2030
                   addr_total_stx["$address"]=$stx_reward
                fi
 
@@ -432,7 +515,94 @@ query_miner_power() {
                fi
                local win_rate
                win_rate="$(echo "scale=2; (${addr_counts["$addr"]} * 100) / $max_blocks" | bc)"
-               printf "%d|%s|%d|%d|%.8f|%.2f|%.2f\n" ${addr_counts["$addr"]} "$addr" ${addr_total_btc["$addr"]} ${addr_total_stx["$addr"]} "$stx_per_btc" "$win_rate" "$miner_power"
+               printf "%d|%s|%d|%d|%.8f|%.2f|%.2f\n" "${addr_counts["$addr"]}" "$addr" "${addr_total_btc["$addr"]}" "${addr_total_stx["$addr"]}" "$stx_per_btc" "$win_rate" "$miner_power"
+            done
+       ) | sort -rh
+}
+
+query_nakamoto_miner_power() {
+   local min_btc_height="$1"
+
+   local tip=""
+   local height=""
+   local addr=""
+   local count=0
+
+   height="$(sqlite3 -noheader "$STACKS_SORTITION_DB" "SELECT MAX(block_height) FROM snapshots")"
+   local max_blocks=$((height - min_btc_height))
+
+   printf "total_blocks|address|total_btc_sats|total_ustx|stx_per_btc|win_rate|power\n"
+   sqlite3 -noheader "$STACKS_HEADERS_DB" \
+        "WITH RECURSIVE block_ancestors(burn_header_height,parent_block_id,address,burnchain_commit_burn,stx_reward) AS (
+             SELECT nakamoto_block_headers.burn_header_height, nakamoto_block_headers.parent_block_id, payments.address, payments.burnchain_commit_burn, (payments.coinbase + payments.tx_fees_anchored + payments.tx_fees_streamed) AS stx_reward 
+             FROM nakamoto_block_headers JOIN payments ON nakamoto_block_headers.index_block_hash = payments.index_block_hash WHERE nakamoto_block_headers.tenure_changed = 1
+             
+             UNION ALL
+             
+             SELECT nakamoto_block_headers.burn_header_height, nakamoto_block_headers.parent_block_id, payments.address, payments.burnchain_commit_burn, (payments.coinbase + payments.tx_fees_anchored + payments.tx_fees_streamed) AS stx_reward 
+             FROM (nakamoto_block_headers JOIN payments ON nakamoto_block_headers.index_block_hash = payments.index_block_hash) JOIN block_ancestors ON nakamoto_block_headers.index_block_hash = block_ancestors.parent_block_id
+
+             ORDER BY nakamoto_block_headers.burn_header_height DESC
+        )
+        SELECT block_ancestors.burn_header_height, block_ancestors.address, block_ancestors.burnchain_commit_burn, block_ancestors.stx_reward FROM block_ancestors LIMIT $max_blocks" | (
+            declare -A addr_counts
+            declare -A addr_total_btc
+            declare -A addr_total_stx
+
+            local address
+            local btc_commit
+            local stx_reward
+            local cur_burn_height
+
+            while IFS="|" read -r cur_burn_height address btc_commit stx_reward; do
+               if (( "$cur_burn_height" <= "$min_btc_height" )); then
+                  continue;
+               fi
+
+               # shellcheck disable=SC2031
+               if [[ -v "addr_counts[$address]" ]]; then
+                  # shellcheck disable=SC2030,SC2031
+                  addr_counts["$address"]=$((addr_counts["$address"] + 1))
+               else
+                  # shellcheck disable=SC2030
+                  addr_counts["$address"]=1
+               fi
+
+               # shellcheck disable=SC2031
+               if [[ -v "addr_total_btc[$address]" ]]; then
+                  # shellcheck disable=SC2030,SC2031
+                  addr_total_btc["$address"]=$((addr_total_btc["$address"] + btc_commit))
+               else
+                  # shellcheck disable=SC2030
+                  addr_total_btc["$address"]=$btc_commit
+               fi
+
+               # shellcheck disable=SC2031
+               if [[ -v "addr_total_stx[$address]" ]]; then
+                  # shellcheck disable=SC2030,SC2031
+                  addr_total_stx["$address"]=$((addr_total_stx["$address"] + stx_reward))
+               else
+                  # shellcheck disable=SC2030
+                  addr_total_stx["$address"]=$stx_reward
+               fi
+
+               count=$((count + 1))
+            done
+
+            addr_counts["(no-canonical-sortition)"]=$((max_blocks - count))
+            addr_total_btc["(no-canonical-sortition)"]=0
+            addr_total_stx["(no-canonical-sortition)"]=0
+
+            for addr in "${!addr_counts[@]}"; do
+               local stx_per_btc="0.00000000"
+               local miner_power="0.00"
+               if (( ${addr_total_btc["$addr"]} != 0 )); then
+                  stx_per_btc="$(echo "scale=8; (${addr_total_stx["$addr"]} / 1000000.0) / (${addr_total_btc["$addr"]} / 100000000.0)" | bc)"
+                  miner_power="$(echo "scale=2; (${addr_counts["$addr"]} * 100) / $count" | bc)"
+               fi
+               local win_rate
+               win_rate="$(echo "scale=2; (${addr_counts["$addr"]} * 100) / $max_blocks" | bc)"
+               printf "%d|%s|%d|%d|%.8f|%.2f|%.2f\n" "${addr_counts["$addr"]}" "$addr" "${addr_total_btc["$addr"]}" "${addr_total_stx["$addr"]}" "$stx_per_btc" "$win_rate" "$miner_power"
             done
        ) | sort -rh
 }
@@ -446,6 +616,26 @@ query_successful_miners() {
    btc_height="$(sqlite3 -noheader "$STACKS_SORTITION_DB" "SELECT MAX(block_height) FROM snapshots")"
    min_btc_height=$((btc_height - btc_height_range))
    min_stacks_height="$(sqlite3 -noheader "$STACKS_HEADERS_DB" "SELECT MIN(block_height) from block_headers WHERE burn_header_height >= $min_btc_height")"
+
+   printf "total_blocks|address|total_btc|total_stx\n"
+   sqlite3 -noheader "$STACKS_HEADERS_DB" "SELECT DISTINCT address FROM payments WHERE stacks_block_height >= $min_stacks_height" | ( \
+      local addr=""
+      local columns="COUNT(index_block_hash) AS total_blocks,address,SUM(burnchain_commit_burn) AS total_btc,(SUM(coinbase + tx_fees_anchored + tx_fees_streamed)) AS total_stx"
+      while read -r addr; do 
+         sqlite3 -noheader "$STACKS_HEADERS_DB" "SELECT $columns FROM payments WHERE address = '$addr' AND stacks_block_height >= $min_stacks_height LIMIT 1"
+      done
+   ) | sort -rh
+}
+
+query_successful_nakamoto_miners() {
+   local btc_height_range="$1"
+   local btc_height
+   local min_btc_height
+   local min_stacks_height
+
+   btc_height="$(sqlite3 -noheader "$STACKS_SORTITION_DB" "SELECT MAX(block_height) FROM snapshots")"
+   min_btc_height=$((btc_height - btc_height_range))
+   min_stacks_height="$(sqlite3 -noheader "$NAKAMOTO_HEADERS_DB" "SELECT MIN(block_height) from nakamoto_block_headers WHERE burn_header_height >= $min_btc_height")"
 
    printf "total_blocks|address|total_btc|total_stx\n"
    sqlite3 -noheader "$STACKS_HEADERS_DB" "SELECT DISTINCT address FROM payments WHERE stacks_block_height >= $min_stacks_height" | ( \
@@ -484,12 +674,15 @@ query_stacks_microblocks() {
 
 decode_pox_addr_b58() {
    local addr_b58="$1"
-
-   local addr_bytes="$(echo "$addr_b58" | base58 -d | xxd -p -l 65536)"
-   local addr_version="${addr_bytes:0:2}"
-   local addr_hash_and_checksum="${addr_bytes:2}"
+   local addr_bytes
+   local addr_version
+   local addr_hash_and_checksum
    local stx_version="unknown"
    local addr_hash="unknown"
+   
+   addr_bytes="$(echo "$addr_b58" | base58 -d | xxd -p -l 65536)"
+   addr_version="${addr_bytes:0:2}"
+   addr_hash_and_checksum="${addr_bytes:2}"
 
    if [[ "$addr_version" = "00" ]] || [[ "$addr_version" = "05" ]]; then 
       # p2pkh or p2sh
@@ -510,6 +703,7 @@ decode_pox_addr() {
    local mode="$1"
    local addr_str="$2"
    if [[ "$mode" = "standard" ]]; then
+      # shellcheck disable=SC2046
       set -- $(decode_pox_addr_b58 "$addr_str")
       local stx_version="$1"
       local addr_hash="$2"
@@ -526,7 +720,7 @@ decode_pox_addr() {
          echo "{\"Standard\":[{\"version\":$stx_version,\"bytes\":\"$addr_hash\"},\"SerializeP2SH\"]}"
       else
          # unreachable
-	 return 1
+         return 1
       fi
       return 0
    fi
@@ -538,33 +732,32 @@ query_pox_payouts() {
    local reward_cycle="$1"
    local addr_json="$2"
    
-   local start_height=$(($reward_cycle * 2100 + 666050))
-   local end_height=$(( ($reward_cycle + 1) * 2100 + 666050))
+   local start_height=$((reward_cycle * 2100 + 666050))
+   local end_height=$(( (reward_cycle + 1) * 2100 + 666050))
 
    echo "block_height|btc_payout"
-   sqlite3 -noheader "$STACKS_SORTITION_DB" "SELECT block_height,pox_payouts FROM snapshots WHERE pox_valid = 1 AND block_height >= "$start_height" AND block_height < "$end_height" ORDER BY block_height DESC" | \
-      fgrep "$addr_json" | \
+   sqlite3 -noheader "$STACKS_SORTITION_DB" "SELECT block_height,pox_payouts FROM snapshots WHERE pox_valid = 1 AND block_height >= $start_height AND block_height < $end_height ORDER BY block_height DESC" | \
+      grep -F "$addr_json" | \
       (
-	 local block_height
-         local pox_payouts
-	 local pox_btc=0
-	 local total_payout=0
-	 local num_payouts=0
-	 local num_pox_payouts=0
-	 local i=0
+        local block_height
+        local pox_payouts
+        local total_payout=0
+        local num_payouts=0
+        local num_pox_payouts=0
+        local total_payout_btc
 
-	 while IFS="|" read -r block_height pox_payouts; do
-            pox_payout="$(echo "$pox_payouts" | jq -r '.[1]')"
-	    num_pox_payouts="$(echo "$pox_payouts" | grep -Fo "$addr_json" | wc -l)"
-	    total_payout=$((total_payout + (pox_payout * num_pox_payouts)))
-	    num_payouts=$((num_payouts + num_pox_payouts))
-            for i in $(seq 1 $num_pox_payouts); do
-               echo "$block_height|$pox_payout"
-            done
-         done
+        while IFS="|" read -r block_height pox_payouts; do
+           pox_payout="$(echo "$pox_payouts" | jq -r '.[1]')"
+           num_pox_payouts="$(echo "$pox_payouts" | grep -Fo "$addr_json" | wc -l)"
+           total_payout=$((total_payout + (pox_payout * num_pox_payouts)))
+           num_payouts=$((num_payouts + num_pox_payouts))
+           for _ in $(seq 1 "$num_pox_payouts"); do
+              echo "$block_height|$pox_payout"
+           done
+        done
 
-	 local total_payout_btc="$(echo "scale=8; $total_payout / 10^8" | bc)"
-	 echo "total: $num_payouts|$total_payout ("$total_payout_btc" BTC)"
+        total_payout_btc="$(echo "scale=8; $total_payout / 10^8" | bc)"
+        echo "total: $num_payouts|$total_payout ($total_payout_btc BTC)"
       )
 
    return 0
@@ -625,6 +818,31 @@ get_page_list_stacks_blocks() {
    return 0
 }
 
+get_page_list_nakamoto_blocks() {
+   local format="$1"
+   local limit="$2"
+   local page="$3"
+   local query="WHERE tenure_changed = 1 ORDER BY block_height DESC"
+   if [[ "$limit" != "all" ]]; then
+     local offset=$((page * limit))
+     query="$query LIMIT $limit OFFSET $offset"
+   fi
+
+   if [[ "$format" = "html" ]]; then 
+      echo "<h3 id=\"nakamoto_history\"><b>Nakamoto Blockchain History</b></h3>" | http_stream
+      make_prev_next_buttons "/nakamoto/history" "$page" | http_stream
+      query_processed_nakamoto_blocks_by_height "$query" | \
+         sed -r 's/([0-9a-f]{64})/<a href="\/nakamoto\/tenures\/\1">\1<\/a>/g' | \
+         rows_to_table | \
+         http_stream
+
+   elif [[ "$format" = "json" ]]; then
+      query_nakamoto_block_ptrs "$query" | rows_to_json | http_stream
+   fi
+
+   return 0
+}
+
 get_page_list_sortitions() {
    local format="$1"
    local limit="$2"
@@ -636,7 +854,7 @@ get_page_list_sortitions() {
    fi
    
    if [[ "$format" = "html" ]]; then 
-      echo "<h3 id=\"stacks_sortitions\"><b>Sortition history</b></h3>" | http_stream
+      echo "<h3 id=\"stacks_sortitions\"><b>Sortition History</b></h3>" | http_stream
       make_prev_next_buttons "/stacks/sortitions" "$page" | http_stream
       query_sortitions "$query" | \
          sed -r \
@@ -647,6 +865,33 @@ get_page_list_sortitions() {
 
    elif [[ "$format" = "json" ]]; then
       query_sortitions "$query" | rows_to_json | http_stream
+   fi
+
+   return 0
+}
+
+get_page_list_nakamoto_sortitions() {
+   local format="$1"
+   local limit="$2"
+   local page="$3"
+   local query="WHERE snapshots.pox_valid = 1 AND snapshots.block_height >= ${NAKAMOTO_START_HEIGHT} ORDER BY snapshots.block_height DESC"
+   if [[ "$limit" != "all" ]]; then
+     local offset=$((page * limit))
+     query="$query LIMIT $limit OFFSET $offset"
+   fi
+   
+   if [[ "$format" = "html" ]]; then 
+      echo "<h3 id=\"nakamoto_sortitions\"><b>Nakamoto Sortition History</b></h3>" | http_stream
+      make_prev_next_buttons "/nakamoto/sortitions" "$page" | http_stream
+      query_nakamoto_sortitions "$query" | \
+         sed -r \
+            -e 's/0{64}/no winner/g' \
+            -e 's/([0-9a-f]{64})$/<a href="\/nakamoto\/tenures\/\1">\1<\/a>/g' | \
+         rows_to_table | \
+         http_stream
+
+   elif [[ "$format" = "json" ]]; then
+      query_nakamoto_sortitions "$query" | rows_to_json | http_stream
    fi
 
    return 0
@@ -673,6 +918,32 @@ get_page_list_miners() {
 
    elif [[ "$format" = "json" ]]; then
       query_stacks_block_miners "$query" | rows_to_json | http_stream
+   fi
+
+   return 0
+}
+
+get_page_list_nakamoto_miners() {
+   local format="$1"
+   local limit="$2"
+   local page="$3"
+   local query="ORDER BY payments.stacks_block_height DESC"
+   if [[ "$limit" != "all" ]]; then
+     local offset=$((page * limit))
+     query="$query LIMIT $limit OFFSET $offset"
+   fi
+   
+   if [[ "$format" = "html" ]]; then 
+      echo "<h3 id=\"nakamoto_miners\"><b>Nakamoto Block Miner History</b></h3>" | http_stream
+      make_prev_next_buttons "/nakamoto/miners" "$page" | http_stream
+      query_nakamoto_block_miners "$query" | \
+         sed -r \
+            -e 's/([0-9a-f]{64})$/<a href="\/nakamoto\/tenures\/\1">\1<\/a>/g' | \
+         rows_to_table | \
+         http_stream
+
+   elif [[ "$format" = "json" ]]; then
+      query_nakamoto_block_miners "$query" | rows_to_json | http_stream
    fi
 
    return 0
@@ -728,6 +999,31 @@ get_page_miner_power() {
    return 0
 }
 
+get_page_nakamoto_miner_power() {
+   local format="$1"
+   local chain_depth="$2"
+
+   local burnchain_block_height
+   local min_btc_height
+
+   burnchain_block_height="$(query_burnchain_height)"   
+   min_btc_height=$((burnchain_block_height - chain_depth))
+
+   if (( min_btc_height < 0 )); then
+      min_btc_height=0
+   fi
+   
+   if [[ "$format" = "html" ]]; then
+      echo "<h3 id=\"nakamoto_miner_power\"><b>Miner Power for the Last $chain_depth Blocks</b></h3>" | http_stream
+      query_nakamoto_miner_power "$min_btc_height" | rows_to_table | http_stream
+
+   elif [[ "$format" = "json" ]]; then
+      query_nakamoto_miner_power "$min_btc_height" | rows_to_json | http_stream
+   fi
+
+   return 0
+}
+
 get_page_successful_miners() {
    local format="$1"
    local btc_height_range="$2"
@@ -738,6 +1034,21 @@ get_page_successful_miners() {
 
    elif [[ "$format" = "json" ]]; then
       query_successful_miners "$btc_height_range" | rows_to_json | http_stream
+   fi
+
+   return 0
+}
+
+get_page_successful_nakamoto_miners() {
+   local format="$1"
+   local btc_height_range="$2"
+
+   if [[ "$format" = "html" ]]; then 
+      echo "<h3 id=\"successful_nakamoto_miners\"><b>Successful Miners for the Last $btc_height_range Bitcoin blocks</b></h3>" | http_stream
+      query_successful_nakamoto_miners "$btc_height_range" | rows_to_table | http_stream
+
+   elif [[ "$format" = "json" ]]; then
+      query_successful_nakamoto_miners "$btc_height_range" | rows_to_json | http_stream
    fi
 
    return 0
@@ -789,7 +1100,7 @@ get_page_stacks_block() {
    local raw_block
 
    has_block_processed="$(
-      if [[ "$(query_stacks_miners "$miner_query" | wc -l)" = "0" ]]; then
+      if [[ "$(query_miners "$miner_query" | wc -l)" = "0" ]]; then
          echo "0"
       else
          echo "1"
@@ -824,7 +1135,7 @@ get_page_stacks_block() {
      ))"
 
    if [[ "$format" = "html" ]]; then
-      query_stacks_miners "$miner_query" | ( \
+      query_miners "$miner_query" | ( \
             row_transpose "block_id" "$index_block_hash"
             echo "burn_block_height|$burn_block_height"
             echo "parent|<a href=\"/stacks/blocks/$parent_index_block_hash\">$parent_index_block_hash</a>"
@@ -843,7 +1154,7 @@ get_page_stacks_block() {
 
    elif [[ "$format" = "json" ]]; then
       echo "{\"metadata\": " | http_stream
-      query_stacks_miners "$miner_query" | \
+      query_miners "$miner_query" | \
          rows_to_json | \
          http_stream
       echo ", \"parent\": \"$parent_index_block_hash\", " | http_stream
@@ -877,6 +1188,150 @@ get_page_stacks_block() {
       http_chunk "$block_json"
       echo ", \"raw\": \"$raw_block\" }" | http_stream
       http_json_end
+   fi
+   
+   return 0
+}
+
+get_page_nakamoto_block() {
+   local format="$1"
+   local index_block_hash="$2"
+
+   if [[ "$format" = "html" ]]; then
+      http_page_begin
+   elif [[ "$format" = "json" ]]; then
+      http_json_begin
+   fi
+
+   local block_query="WHERE index_block_hash = '$index_block_hash' LIMIT 1"
+
+   local has_block_processed
+   local burn_block_height
+   local parent_index_block_hash
+   local block_json="(none)"
+   local raw_block="(none)"
+
+   burn_block_height="$(sqlite3 -noheader "$NAKAMOTO_HEADERS_DB" "SELECT burn_header_height FROM nakamoto_block_headers WHERE index_block_hash = '$index_block_hash'")"
+   raw_block="$(sqlite3 -noheader "$NAKAMOTO_STAGING_DB" "SELECT lower(hex(data)) FROM nakamoto_staging_blocks WHERE index_block_hash = '$index_block_hash'")"
+
+   if [[ "$format" = "html" ]]; then
+      query_nakamoto_block_ptrs "$block_query" | ( \
+            row_transpose "block_id" "$index_block_hash" | \
+                sed -r 's!parent_block_id\|([0-9a-f]{64})!parent_block_id|<a href="\/nakamoto\/blocks\/\1">\1<\/a>!g'
+            echo "burn_block_height|$burn_block_height"
+         ) | \
+         rows_to_table | \
+         http_stream
+
+   elif [[ "$format" = "json" ]]; then
+      echo "{\"metadata\": " | http_stream
+      query_nakamoto_block_ptrs "$block_query" | \
+         rows_to_json | \
+         http_stream
+      echo ", \"burn_block_height\": \"$burn_block_height\", " | http_stream
+   fi
+
+   if [[ "$format" = "html" ]]; then
+      echo "<br><div style='font-family:\"Courier New\", Courier, monospace; font-size:80%'><b>Block</b><br><pre style=\"display: block; white-space: pre-wrap;\">" | http_stream
+      stacks-inspect decode-nakamoto-block "$raw_block" | http_stream
+      echo "</code><br>" | http_stream
+      
+      echo "<div style='font-family:\"Courier New\", Courier, monospace'><b>Raw block</b><br><div style=\"overflow-wrap: break-word;\"><br>" | http_stream
+      http_chunk "$raw_block"
+      echo "</div>" | http_stream
+      http_page_end
+
+   elif [[ "$format" = "json" ]]; then
+      echo "\"block\": " | http_stream
+      http_chunk "$block_json"
+      echo ", \"raw\": \"$raw_block\" }" | http_stream
+      http_json_end
+   fi
+   
+   return 0
+}
+
+get_page_nakamoto_tenure() {
+   local format="$1"
+   local index_block_hash="$2"
+
+   if [[ "$format" = "html" ]]; then
+      http_page_begin
+   elif [[ "$format" = "json" ]]; then
+      http_json_begin
+   fi
+
+   local miner_query="WHERE index_block_hash = '$index_block_hash' AND miner = 1 LIMIT 1"
+   local block_query="WHERE index_block_hash = '$index_block_hash' LIMIT 1"
+   local parent_query="WHERE nakamoto_staging_blocks.index_block_hash = '$index_block_hash' LIMIT 1"
+
+   local has_block_processed
+   local burn_block_height
+   local parent_index_block_hash
+   local tenure_consensus_hash
+   local block_height
+   local block_data
+
+   has_block_processed="$(
+      if [[ "$(query_miners "$miner_query" | wc -l)" = "0" ]]; then
+         echo "0"
+      else
+         echo "1"
+      fi
+   )"
+
+   block_data="$(query_nakamoto_block_ptrs "$block_query" | \
+      rows_to_json | \
+      jq -r '.[].parent_block_id,.[].tenure_consensus_hash' | \
+      tr '\n' ','
+   )"
+
+   IFS="," read -r parent_index_block_hash tenure_consensus_hash <<<"$block_data"
+
+   burn_block_height="$(sqlite3 -noheader "$NAKAMOTO_HEADERS_DB" "SELECT burn_header_height FROM nakamoto_block_headers WHERE index_block_hash = '$index_block_hash'")"
+
+   if [[ "$format" = "html" ]]; then
+      query_miners "$miner_query" | ( \
+            row_transpose "block_id" "$index_block_hash" 
+            echo "burn_block_height|$burn_block_height" 
+            echo "parent|<a href=\"/nakamoto/tenures/$parent_index_block_hash\">$parent_index_block_hash</a>"
+         ) | \
+         rows_to_table | \
+         http_stream
+
+   elif [[ "$format" = "json" ]]; then
+      echo "{\"metadata\": " | http_stream
+      query_miners "$miner_query" | \
+         rows_to_json | \
+         http_stream
+      echo ", \"burn_block_height\": \"$burn_block_height\"" | http_stream
+      echo ", \"parent\": \"$parent_index_block_hash\" }" | http_stream
+   fi
+   
+   if [[ "$format" = "html" ]]; then
+      echo "<br><b>Tenure Blocks</b><br>" | http_stream
+      sqlite3 -header "$NAKAMOTO_HEADERS_DB" "SELECT block_height as height, index_block_hash, total_tenure_cost FROM nakamoto_block_headers WHERE consensus_hash = '$tenure_consensus_hash' ORDER BY block_height DESC" | ( \
+         local height
+         local index_block_hash
+         local total_tenure_cost
+         local fullness
+         local past_headers=0
+        
+         IFS="|"
+         while read -r height index_block_hash total_tenure_cost; do
+            if [ $past_headers -eq 0 ]; then 
+               past_headers=1
+               echo "$height|$index_block_hash|%rc,%rl,%wc,%wl,%rt"
+            else
+               fullness="$(calculate_block_fullness "$total_tenure_cost")"
+               echo "$height|$index_block_hash|$fullness"
+            fi
+         done
+      ) | \
+         rows_to_table | \
+         sed -r 's!([0-9a-f]{64})!<a href="\/nakamoto\/blocks\/\1">\1<\/a>!g' | \
+         http_stream
+      http_page_end
    fi
    
    return 0
@@ -986,8 +1441,11 @@ get_page_pox_payouts() {
    local addr="$3"
    local reward_cycle="$4"
 
-   local addr_json="$(decode_pox_addr "$mode" "$addr")"
-   local rc=$?
+   local addr_json
+   local rc=0
+
+   addr_json="$(decode_pox_addr "$mode" "$addr")"
+   rc=$?
    if [[ $rc != 0 ]]; then
       http_404 "Unrecognized mode and address combination (FYI: segwit/taproot is not yet supported)"
       return 0
@@ -1005,7 +1463,7 @@ get_page_pox_payouts() {
       http_json_begin
       query_pox_payouts "$reward_cycle" "$addr_json" | \
          rows_to_json | \
-	 http_stream
+         http_stream
 
       http_json_end
    fi
@@ -1043,7 +1501,7 @@ parse_request() {
       fi
 
       tok="$(echo "$reqline" | grep -i "content-length" | cut -d ' ' -f 2)" || true
-      if [ -n "$tok" ] && [ $content_length -eq 0 ]; then
+      if [ -n "$tok" ] && [ "$content_length" -eq "0" ]; then
          if [[ "$tok" =~ ^[0-9]+$ ]]; then
             content_length="$tok"
             continue
@@ -1112,6 +1570,28 @@ handle_request() {
                      rc=$?
                   fi
                   ;;
+               
+               /nakamoto/tenures/*)
+                  local index_block_hash="${reqpath#/nakamoto/tenures/}"
+                  if ! [[ "$index_block_hash" =~ ^[0-9a-f]{64}$ ]]; then
+                     http_401
+                     status=401
+                  else
+                     get_page_nakamoto_tenure "html" "$index_block_hash"
+                     rc=$?
+                  fi
+                  ;;
+               
+               /nakamoto/blocks/*)
+                  local index_block_hash="${reqpath#/nakamoto/blocks/}"
+                  if ! [[ "$index_block_hash" =~ ^[0-9a-f]{64}$ ]]; then
+                     http_401
+                     status=401
+                  else
+                     get_page_nakamoto_block "html" "$index_block_hash"
+                     rc=$?
+                  fi
+                  ;;
 
                /stacks/microblocks/*)
                   local args="${reqpath#/stacks/microblocks/}"
@@ -1142,6 +1622,19 @@ handle_request() {
                      http_page_end
                   fi
                   ;;
+               
+               /nakamoto/history/*)
+                  local page="${reqpath#/nakamoto/history/}"
+                  if ! [[ $page =~ ^[0-9]+$ ]]; then
+                     http_401
+                     status=401
+                  else
+                     http_page_begin
+                     get_page_list_nakamoto_blocks "html" 50 "$page"
+                     rc=$?
+                     http_page_end
+                  fi
+                  ;;
 
                /stacks/sortitions/*)
                   local page="${reqpath#/stacks/sortitions/}"
@@ -1156,6 +1649,19 @@ handle_request() {
                   fi
                   ;;
                
+               /nakamoto/sortitions/*)
+                  local page="${reqpath#/nakamoto/sortitions/}"
+                  if ! [[ $page =~ ^[0-9]+$ ]]; then
+                     http_401
+                     status=401
+                  else
+                     http_page_begin
+                     get_page_list_nakamoto_sortitions "html" 50 "$page"
+                     rc=$?
+                     http_page_end
+                  fi
+                  ;;
+               
                /stacks/miners/*)
                   local page="${reqpath#/stacks/miners/}"
                   if ! [[ $page =~ ^[0-9]+$ ]]; then
@@ -1164,6 +1670,19 @@ handle_request() {
                   else
                      http_page_begin
                      get_page_list_miners "html" 50 "$page"
+                     rc=$?
+                     http_page_end
+                  fi
+                  ;;
+               
+               /nakamoto/miners/*)
+                  local page="${reqpath#/nakamoto/miners/}"
+                  if ! [[ $page =~ ^[0-9]+$ ]]; then
+                     http_401
+                     status=401
+                  else
+                     http_page_begin
+                     get_page_list_nakamoto_miners "html" 50 "$page"
                      rc=$?
                      http_page_end
                   fi
@@ -1195,12 +1714,14 @@ handle_request() {
                
                /stacks/pox-rewards/standard/*)
                   local req="${reqpath#/stacks/pox-rewards/standard/}"
-		  if ! [[ $req =~ ^[123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz]+/[0-9]+$ ]]; then
+                  if ! [[ $req =~ ^[123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz]+/[0-9]+$ ]]; then
                      http_401
                      status=401
                   else
-                     local addr="$(echo "$req" | sed -r 's/^([^\/]+)\/.+$/\1/g')"
-                     local rc="$(echo "$req" | sed -r 's/^[^\/]+\/(.+)$/\1/g')"
+                     local addr
+                     local rc
+                     addr="$(echo "$req" | sed -r 's/^([^\/]+)\/.+$/\1/g')"
+                     rc="$(echo "$req" | sed -r 's/^[^\/]+\/(.+)$/\1/g')"
                      get_page_pox_payouts "html" "standard" "$addr" "$rc"
                      rc=$?
                   fi
@@ -1209,18 +1730,18 @@ handle_request() {
                /|/index.html)
                   http_page_begin
                   printf "%s\n%s\n%s\n%s\n%s\n%s\n" \
-                     "stacks_history|Stacks Blockchain History" \
-                     "stacks_sortitions|Sortition History" \
-                     "stacks_miners|Stacks Block Miner History" \
-                     "miner_power|Stacks Miner Power" \
-                     "successful_miners|Successful Miners (all forks)" \
+                     "nakamoto_history|Nakamoto Blockchain History" \
+                     "nakamoto_sortitions|Sortition History" \
+                     "nakamoto_miners|Nakamoto Block Miner History" \
+                     "nakamoto_miner_power|Nakamoto Miner Power" \
+                     "successful_nakamoto_miners|Successful Miners (all forks)" \
                      "stacks_mempool|Node Mempool" | \
                      print_table_of_contents | http_stream
-                  get_page_list_stacks_blocks "html" 50 0
-                  get_page_list_sortitions "html" 50 0
-                  get_page_list_miners "html" 50 0
-                  get_page_miner_power "html" 144
-                  get_page_successful_miners "html" 144
+                  get_page_list_nakamoto_blocks "html" 50 0
+                  get_page_list_nakamoto_sortitions "html" 50 0
+                  get_page_list_nakamoto_miners "html" 50 0
+                  get_page_nakamoto_miner_power "html" 144
+                  get_page_successful_nakamoto_miners "html" 144
                   get_page_list_mempool "html" 50 0
                   http_page_end
                   ;;
@@ -1234,6 +1755,17 @@ handle_request() {
                      get_page_stacks_block "json" "$index_block_hash"
                   fi
                   ;;
+               
+               /api/nakamoto/blocks/*)
+                  local index_block_hash="${reqpath#/api/nakamoto/blocks/}"
+                  if ! [[ "$index_block_hash" =~ ^[0-9a-f]{64}$ ]]; then
+                     http_401
+                     status=401
+                  else
+                     get_page_nakamoto_block "json" "$index_block_hash"
+                  fi
+                  ;;
+               
                
                /api/microblocks/*)
                   local args="${reqpath#/api/microblocks/}"
@@ -1258,10 +1790,24 @@ handle_request() {
                   rc=$?
                   http_json_end
                   ;;
+               
+               /api/nakamoto/history)
+                  http_json_begin
+                  get_page_list_nakamoto_blocks "json" "all" "all"
+                  rc=$?
+                  http_json_end
+                  ;;
 
                /api/sortitions)
                   http_json_begin
                   get_page_list_sortitions "json" "all" "all"
+                  rc=$?
+                  http_json_end
+                  ;;
+               
+               /api/nakamoto/sortitions)
+                  http_json_begin
+                  get_page_list_nakamoto_sortitions "json" "all" "all"
                   rc=$?
                   http_json_end
                   ;;
@@ -1272,10 +1818,24 @@ handle_request() {
                   rc=$?
                   http_json_end
                   ;;
+               
+               /api/nakamoto/miners)
+                  http_json_begin
+                  get_page_list_nakamoto_miners "json" "all" "all"
+                  rc=$?
+                  http_json_end
+                  ;;
 
                /api/miner_power)
                   http_json_begin
                   get_page_miner_power "json" 144
+                  rc=$?
+                  http_json_end
+                  ;;
+               
+               /api/nakamoto/miner_power)
+                  http_json_begin
+                  get_page_nakamoto_miner_power "json" 144
                   rc=$?
                   http_json_end
                   ;;
@@ -1288,6 +1848,19 @@ handle_request() {
                   else
                      http_json_begin
                      get_page_miner_power "json" "$depth"
+                     rc=$?
+                     http_json_end
+                  fi
+                  ;;
+               
+               /api/nakamoto/miner_power/*)
+                  local depth="${reqpath#/api/nakamoto/miner_power/}"
+                  if ! [[ "$depth" =~ ^[0-9]+$ ]]; then 
+                     http_401
+                     status=401
+                  else
+                     http_json_begin
+                     get_page_nakamoto_miner_power "json" "$depth"
                      rc=$?
                      http_json_end
                   fi
@@ -1360,6 +1933,7 @@ elif [ "$MODE" = "test" ]; then
    # undocumented test mode
    shift 2
    REPORT_MODE="text"
+   # shellcheck disable=SC2294
    eval "$@"
    exit 0
 fi
